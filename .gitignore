@@ -1,1 +1,15 @@
 venv/
+.venv/
+qip_venv/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated artefacts: figures, annotated scans, trained models, cached Gram matrices
+outputs/
+
+# Large raw upload
+archive.zip
+
+.ipynb_checkpoints/

@@ -1,0 +1,20 @@
+# Verified against the qip_venv interpreter (Python 3.14.4, Windows).
+# qiskit-machine-learning is deliberately absent: it publishes no cp314/abi3
+# wheel, so the quantum kernel is built directly on qiskit primitives.
+
+qiskit==2.5.1
+qiskit-aer==0.17.2
+qiskit-ibm-runtime==0.48.0
+
+numpy==2.5.1
+scipy==1.18.0
+scikit-learn==1.9.1
+joblib==1.6.0
+threadpoolctl==3.7.0
+
+opencv-python==5.0.0.93
+pillow==12.3.0
+
+matplotlib==3.11.1
+seaborn==0.13.2
+pandas==3.0.5
