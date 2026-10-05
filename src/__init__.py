@@ -1,1 +1,1 @@
-"""Package marker for the thyroid quantum-CAD source tree."""
+# HQVision Source Package
