@@ -24,7 +24,7 @@ from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
 from qiskit.quantum_info import Statevector
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.svm import SVC
 
 from . import config
@@ -153,18 +153,24 @@ def overlap_gram(A: np.ndarray, B: np.ndarray | None = None) -> np.ndarray:
 # --- Classifier --------------------------------------------------------------
 @dataclass
 class EncodingParams:
-    """Parameters needed to encode a raw 4x4 patch into the angle domain."""
+    """Parameters needed to encode a raw feature vector into the angle domain."""
 
+    standard: StandardScaler
     pca: PCA
     scaler: MinMaxScaler
 
 
 class QuantumKernelClassifier:
-    """PCA -> angle scaling -> quantum kernel -> precomputed-kernel SVC.
+    """Standardise -> PCA -> angle scaling -> quantum kernel -> precomputed SVC.
 
     Every transform is fitted on the training split only. Fitting the scaler on
     the full dataset (as the original script did) leaks test-set statistics into
     training and inflates reported accuracy.
+
+    The standardisation step is not cosmetic: raw pixels live in 0-255 while the
+    context features live in roughly 0-3, and PCA maximises captured variance. Without
+    z-scoring first it would discard the context features entirely, which is the
+    opposite of what they are there for.
     """
 
     def __init__(
@@ -199,20 +205,26 @@ class QuantumKernelClassifier:
         raise ValueError(f"Unknown kernel: {self.kernel}")
 
     def fit_encode(self, X_raw: np.ndarray) -> np.ndarray:
-        """Fit PCA + MinMax on training data only, then transform it."""
+        """Fit StandardScaler + PCA + MinMax on training data only, then transform it."""
         X_raw = np.asarray(X_raw, dtype=float)
+        standard = StandardScaler()
+        standardised = standard.fit_transform(X_raw)
         pca = PCA(n_components=self.pca_dims, random_state=config.SEED)
-        reduced = pca.fit_transform(X_raw)
+        reduced = pca.fit_transform(standardised)
         scaler = MinMaxScaler(feature_range=self.angle_range)
         scaled = scaler.fit_transform(reduced)
-        self.encoding = EncodingParams(pca=pca, scaler=scaler)
+        self.encoding = EncodingParams(standard=standard, pca=pca, scaler=scaler)
         return scaled
 
     def encode(self, X_raw: np.ndarray) -> np.ndarray:
         """Transform new data with the *fitted* training parameters."""
         if self.encoding is None:
             raise RuntimeError("Call fit_encode() before encode().")
-        return self.encoding.scaler.transform(self.encoding.pca.transform(X_raw))
+        return self.encoding.scaler.transform(
+            self.encoding.pca.transform(
+                self.encoding.standard.transform(np.asarray(X_raw, dtype=float))
+            )
+        )
 
     def kernel_matrix(self, A: np.ndarray, B: np.ndarray | None = None) -> np.ndarray:
         if self.kernel in {"overlap", "pennylane_overlap"}:

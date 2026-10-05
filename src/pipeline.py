@@ -131,7 +131,7 @@ class ThyroidCADPipeline:
                 scores=[], bbox=bbox,
             )
 
-        X = np.array([p.flatten() for p in patches], dtype=np.float64)
+        X = np.array([np.asarray(p).reshape(-1) for p in patches], dtype=np.float64)
         gram = self.model.test_gram(X)
         labels = self.model.predict_from_gram(gram)
         scores = self.model.decision_from_gram(gram)

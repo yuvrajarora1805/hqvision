@@ -84,6 +84,24 @@ NMS_RADIUS = 4  # pixels; suppress secondary peaks within this radius
 MAX_CANDIDATES = 5  # K, retained per nodule ROI
 WEBER_EPS = 1e-5
 
+# Context features. A 4x4 crop on its own cannot tell a suspicious focus from
+# speckle: both are just bright pixels, and what separates them is the
+# *surround* -- a compact core inside a darker neighbourhood, a soft acoustic
+# shadow underneath. These five numbers describe that surround and are appended
+# to the 16 raw pixels (16 + 5 = 21 features). Set USE_CONTEXT_FEATURES = False to
+# reproduce the original 16-pixel baseline for the ablation.
+USE_CONTEXT_FEATURES = True
+FEATURE_VERSION = 2  # bump to invalidate the mined-patch cache
+CONTEXT_WINDOW = 3  # 7x7 window for local std (speckle is locally noisy)
+RING_INNER = 1  # core half-width excluded from the surround ring
+RING_OUTER = 3  # surround ring half-width, measured on the top-hat image
+SHADOW_DEPTH = 4  # rows below the peak where posterior shadowing is measured
+SHADOW_HEIGHT = 6
+SHADOW_WIDTH = 3
+RAW_FEATURES = PATCH_SIZE * PATCH_SIZE
+CONTEXT_FEATURES = 5
+FEATURE_DIM = RAW_FEATURES + (CONTEXT_FEATURES if USE_CONTEXT_FEATURES else 0)
+
 # --- Module 3: quantum engine ------------------------------------------------
 N_QUBITS = 4
 N_REPS = 2

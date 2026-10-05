@@ -108,10 +108,20 @@ tracheal reverberations, muscle) is zeroed before peak detection.
 - Local Weber contrast: C = (I_peak − I_bg) / (I_bg + ε); NMS radius R = 4 px;
   keep top K = 5.
 
-#### 2.5 Native micro-patch extraction (`src/mining.py`)
-4×4 crop at native resolution → 16-dim float feature vector. Yields
-**19,973 train patches / 4,998 test patches**, and every one of the 5,000 nodules
-produced at least one candidate in the verification run.
+#### 2.5 Native micro-patch extraction + context features (`src/mining.py`)
+- 4×4 crop at native resolution → 16 raw features per candidate.
+- **Plus 5 surround-context features** (a 4×4 crop cannot tell a real focus from speckle —
+  both are just bright pixels; the neighbourhood is what separates them):
+  1. Weber contrast — already computed for NMS ranking, previously discarded before the
+     classifier saw it;
+  2. local std (7×7) — speckle is grainy, a genuine focus is smoother than its surround;
+  3. ring contrast — top-hat energy in the surround minus the core (compact core vs diffuse blob);
+  4. posterior shadow ratio — mean intensity just below the peak ÷ local mean (values < 1 ⇒ shadow);
+  5. top-hat response at the peak (saliency).
+- Total 21 features per candidate; set `USE_CONTEXT_FEATURES = False` to reproduce the
+  16-pixel baseline for the ablation.
+- Yields **19,973 train patches / 4,998 test patches**; every one of the 5,000 nodules
+  produced at least one candidate in the verification run.
 
 ---
 
@@ -121,7 +131,10 @@ produced at least one candidate in the verification run.
 quantum feature map; measure nodule-level performance after majority vote.
 
 #### 3.1 Dimensionality reduction & angle mapping (`src/quantum_engine.py`)
-PCA 16 → 4 fitted **on train only**; Min-Max into [0, π]. (Fitting the scaler on the
+`StandardScaler` → PCA (21 → 4, fitted **on train only**) → Min-Max into [0, π]. The
+scaler before PCA is mandatory, not cosmetic: pixel features live in 0–255 and context
+features in 0–3, and PCA keeps the highest-variance directions, so unscaled it would
+silently discard exactly the features the context step adds. (Fitting any of these on the
 full dataset would leak test statistics — a bug in the original script.)
 
 #### 3.2 Parameterized quantum circuit (`src/quantum_engine.py`)
@@ -177,9 +190,12 @@ cross-kernel re-evaluated with `noisy_fidelity_gram()` → accuracy decay curve.
 (`noisy_fidelity_gram` already fixed and verified: max deviation 0.007 vs the exact
 kernel at 8192 shots.)
 
-#### 5.3 Experiment C: mining ablation
+#### 5.3 Experiment C: mining ablation + feature ablation
 Sweep K ∈ {1, 3, 5, 8}; report nodule-level malignant recall (731 malignant test
-nodules) and the fraction of nodules producing ≥ 1 candidate.
+nodules) and the fraction of nodules producing ≥ 1 candidate. Then retrain with
+`USE_CONTEXT_FEATURES = False` (16 raw px) vs `True` (21 features) to quantify what the
+surround contributes. Finally, a label-noise robustness check: flip 10% / 20% of training
+patch labels and re-measure, to price the weak-supervision limitation.
 
 ---
 
@@ -188,20 +204,22 @@ nodules) and the fraction of nodules producing ≥ 1 candidate.
 ```
 python main.py integrity  → 5000/5000 parsed, 3574 malignant / 1426 benign,
                             official split 4000/1000, overlap 0
-python main.py mine       → 74 s; train X=(19973,16), test X=(4998,16),
+python main.py mine       → 32 s; train X=(19973,21), test X=(4998,21),
                             all 5000 nodules yielded candidates
-python main.py train      → ZZ kernel: patch acc 0.647 / bal 0.628 / AUC 0.654;
-                            nodule acc 0.670 / bal 0.647 / AUC 0.700
+python main.py train      → ZZ kernel: nodule bal acc 0.657 / AUC 0.716
+                            (16-pixel baseline was 0.647 / 0.700)
 python main.py train --kernel overlap
-                          → patch acc 0.679 / bal 0.610 / AUC 0.657;
-                            nodule acc 0.713 / bal 0.632 / AUC 0.689
+                          → nodule bal acc 0.663 / AUC 0.719
+                            (16-pixel baseline was 0.632 / 0.689)
 python main.py predict --image-id 000123 → 5 candidates, verdict + overlay PNG
 python main.py circuit    → ZZ: depth 19 / size 34 / 12 cx; overlap: depth 2 / 0 cx
 ```
 
 These are single-seed **smoke** numbers from an end-to-end wiring check — not
-experiment results. Experiments A–C are still to be run, and no claim of quantum
-advantage may be made from the table above.
+experiment results. The context-feature step improved balanced accuracy and AUC for both
+kernels, but the gains are small because the ceiling is the nodule-level label, not the
+features. Experiments A–C are still to be run, and no claim of quantum advantage may be
+made from the table above.
 
 ---
 
@@ -244,12 +262,14 @@ hqvision/
 - [x] **Phase 1:** Dependencies installed; `src/dataset.py` parses TN5000, audits
       integrity, applies the official split (verified: `main.py integrity`).
 - [x] **Phase 2:** Classical candidate mining sieve (`src/mining.py`) with CLAHE,
-      Top-Hat, Weber NMS; caches written (`main.py mine`, 74 s full run).
+      Top-Hat, Weber NMS; 21 features per candidate (16 raw pixels + 5 context);
+      caches written (`main.py mine`, 32 s full run).
 - [x] **Phase 3:** Qiskit ZZFeatureMap, statevector Gram optimizer, balanced kernel
-      SVC (`src/quantum_engine.py`); patch + nodule metrics (`main.py train`).
+      SVC (`src/quantum_engine.py`); StandardScaler → PCA → angle encoding;
+      patch + nodule metrics (`main.py train`).
 - [x] **Phase 4:** Inference pipeline with red/green overlay and nodule verdict
       (`src/pipeline.py`, `main.py predict`); TI-RADS rescoring removed — TN5000 has
       no TI-RADS metadata.
-- [ ] **Phase 5:** Benchmark experiments (sample efficiency, Aer noise, mining
-      ablation) and charts in `outputs/figures/`.
+- [ ] **Phase 5:** Benchmark experiments (sample efficiency, Aer noise, mining +
+      feature ablation, label-noise robustness) and charts in `outputs/figures/`.
 - [ ] **Report:** final numbers, comparison tables and figures for the report.

@@ -28,7 +28,17 @@ def _cache_key(split: str) -> str:
     """Fingerprint every setting that changes the mined patch set."""
     payload = {
         "split": split,
+        "feature_version": config.FEATURE_VERSION,
         "patch_size": config.PATCH_SIZE,
+        "context": [
+            config.USE_CONTEXT_FEATURES,
+            config.CONTEXT_WINDOW,
+            config.RING_INNER,
+            config.RING_OUTER,
+            config.SHADOW_DEPTH,
+            config.SHADOW_HEIGHT,
+            config.SHADOW_WIDTH,
+        ],
         "clahe": [config.CLAHE_CLIP_LIMIT, list(config.CLAHE_TILE_GRID)],
         "kernel": config.TOPHAT_KERNEL_SIZE,
         "nms_radius": config.NMS_RADIUS,

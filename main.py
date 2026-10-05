@@ -69,6 +69,12 @@ def cmd_mine(args: argparse.Namespace) -> None:
             f"nodules mined={len({m['case_id'] for m in meta})}/{len(recs)}"
         )
 
+        if config.USE_CONTEXT_FEATURES:
+            print(
+                "  features: 16 raw 4x4 pixels + 5 context "
+                "(weber, local std, ring contrast, shadow ratio, tophat peak)"
+            )
+
     # Refresh the on-disk cache so `train` reuses exactly these arrays.
     cache.write_split("train", X_train, y_train, meta_train)
     cache.write_split("test", X_test, y_test, meta_test)

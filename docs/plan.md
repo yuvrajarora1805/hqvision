@@ -92,9 +92,18 @@ ensuring true suspicious foci are almost never discarded upfront.
    * Sort remaining peaks by local Weber contrast score:
      $$C = \frac{I_{\text{peak}} - I_{\text{background}}}{I_{\text{background}} + \epsilon}$$
    * Retain the top K candidate coordinates (K = 5).
-5. **Micro-Patch Cropping:**
+5. **Micro-Patch Cropping + Context Features:**
    * Extract 4×4 pixel patches around each centroid at **original native resolution** (zero
      downsampling) → 16 raw features.
+   * **A 4×4 crop alone cannot separate a real focus from speckle** — both are "bright pixels".
+     Append 5 surround features so the neighbourhood reaches the classifier:
+     1. Weber contrast (peak vs local background) — previously computed for ranking, then discarded;
+     2. local standard deviation (7×7) — speckle is grainy, a real focus is smoother;
+     3. ring contrast — top-hat energy in the surround minus the core (compact core vs diffuse blob);
+     4. posterior shadow ratio — mean intensity just below the peak ÷ local mean (values < 1 ⇒ shadow);
+     5. top-hat response at the peak (saliency).
+   * 21 features per candidate; z-score before PCA (`StandardScaler`) or PCA would discard the
+     context features in favour of the 0–255 pixel scale.
 
 Labels are **weak**: each patch inherits the nodule's biopsy label. A patch inside a
 malignant nodule is tagged 1 even if that particular spot is not the lesion itself —
@@ -108,8 +117,11 @@ This module replaces heuristic spatial despeckling with an entangled quantum fea
 
 ### Implementation Tasks
 1. **Dimensionality Reduction (Fitted on Train Only):**
-   * Fit PCA on `X_train_raw` (16 → 4 components); transform `X_test_raw` with the fitted
-     parameters; Min-Max scale into the angle domain [0, π].
+   * Fit `StandardScaler` → `PCA` on `X_train_raw` (21 → 4 components); transform `X_test_raw`
+     with the fitted parameters; Min-Max scale into the angle domain [0, π].
+   * The scaler before PCA is required: pixel features live in 0–255 and context features in
+     0–3, and PCA keeps the highest-variance directions, so unscaled it would silently throw
+     the context features away.
 2. **Parameterized Circuit Construction:**
    * Qiskit `ZZFeatureMap`: n = 4 qubits, d = 2 repetitions, entanglement `'linear'`
      (keeps CNOT depth low for NISQ feasibility).
@@ -181,12 +193,15 @@ This is the module that proves your thesis and earns top marks during your viva.
     (error rates: 0.1%, 0.5%, 1.0%) and finite shot sampling (N_shots = 1024).
   * Plot accuracy decay vs. noise rate to demonstrate fault tolerance.
 
-### Experiment C: Candidate Mining Sensitivity (Ablation Study)
-* **Goal:** Answer the examiner question: *"Did your classical filter drop real cancers?"*
+### Experiment C: Candidate Mining Sensitivity + Feature Ablation
+* **Goal:** Answer the examiner question: *"Did your classical filter drop real cancers?"* — and
+  *"Are your features actually seeing the lesion, or just bright pixels?"*
 * **Method:**
   * Sweep K ∈ {1, 3, 5, 8} and the top-hat threshold; retrain and report **nodule-level
     malignant recall** (test: 731 malignant nodules) plus the fraction of nodules yielding
     at least one candidate.
+  * Feature ablation: retrain with `USE_CONTEXT_FEATURES = False` (16 raw pixels) vs `True`
+    (21 features) to quantify what the surround contributes.
   * Target: ≥ 96% of malignant nodules still produce candidates (mining is recall-first).
 
 ---

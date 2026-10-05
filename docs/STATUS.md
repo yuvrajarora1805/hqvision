@@ -28,7 +28,7 @@ leakage-safe published split.
 
 ```
 python main.py integrity         # 5000/5000 parsed, 0 missing pairs, split overlap 0
-python main.py mine              # 74 s: 19,973 train / 4,998 test patches (all 5000 nodules hit)
+python main.py mine              # 32 s: 19,973 train / 4,998 test patches, 21 features (all 5000 nodules hit)
 python main.py train             # ZZ kernel SVC, caps at 2000 balanced train patches
 python main.py train --kernel overlap
 python main.py predict --image-id 000123     # overlay written to outputs/annotated_scans/
@@ -37,10 +37,17 @@ python main.py circuit           # ZZ: depth 19 / size 34 / 12 cx; overlap: dept
 
 Smoke metrics (seed 42, single run — **not** experiment results):
 
-| Kernel | patch acc | patch bal acc | patch AUC | nodule acc | nodule bal acc | nodule AUC |
-|---|---|---|---|---|---|---|
-| ZZ feature map | 0.647 | 0.628 | 0.654 | 0.670 | 0.647 | 0.700 |
-| Overlap baseline | 0.679 | 0.610 | 0.657 | 0.713 | 0.632 | 0.689 |
+| Features | Kernel | patch acc / bal / AUC | nodule acc / bal / AUC |
+|---|---|---|---|
+| 16 raw px | ZZ feature map | 0.647 / 0.628 / 0.654 | 0.670 / 0.647 / 0.700 |
+| 16 raw px | Overlap baseline | 0.679 / 0.610 / 0.657 | 0.713 / 0.632 / 0.689 |
+| **+5 context** | **ZZ feature map** | 0.631 / 0.626 / 0.660 | 0.662 / **0.657** / **0.716** |
+| **+5 context** | **Overlap baseline** | 0.674 / **0.642** / **0.684** | 0.701 / **0.663** / **0.719** |
+
+Adding the five surround/context features improved balanced accuracy and AUC for
+**both** kernels (nodule AUC 0.700 → 0.716 for ZZ, 0.689 → 0.719 for overlap). The
+gain is modest because the nodule-level label is still the limit, not the features —
+which is why Experiment A (small-data regime) and the classical baselines matter.
 
 Also verified earlier: `noisy_fidelity_gram()` builds the proper U(a)·U†(b)
 interference circuit (max deviation 0.007 vs exact kernel at 8192 shots).
@@ -53,10 +60,10 @@ interference circuit (max deviation 0.007 vs exact kernel at 8192 shots).
 |---|---|
 | `src/config.py` | TN5000 paths (`$TN5000_DIR` → `data/Main data` → `../TN5000/Main data`), label map, official split names, patch caps |
 | `src/dataset.py` | VOC parser, integrity audit, official/fallback split, bbox → polygon |
-| `src/mining.py` | miner unchanged in behaviour; docstrings/meta now TN5000 (`case_id`) |
+| `src/mining.py` | miner unchanged in behaviour; **now emits 21 features** — 16 raw 4×4 pixels + 5 surround-context features (Weber, local std, ring contrast, shadow ratio, top-hat peak); meta is TN5000 (`case_id`) |
 | `src/cache.py` | rewritten: per-split mined-patch cache, `balanced_subsample`, `get_split_arrays` |
 | `src/pipeline.py` | rewritten: bbox inference, nodule verdict, red/green overlay (no TI-RADS) |
-| `src/quantum_engine.py` | unchanged (dataset-agnostic); noise fix intact |
+| `src/quantum_engine.py` | StandardScaler added *before* PCA (without z-scoring, PCA discards the 0–3 context features in favour of 0–255 pixels); dataset-agnostic; noise fix intact |
 | `main.py` | rewritten: `integrity \| mine \| train \| predict \| circuit` CLI |
 | `train_hybrid_model.py` | marked DEPRECATED (legacy DDTI/PennyLane) — do not run |
 | `docs/plan.md`, `docs/IMPLEMENTATION_PLAN.md` | rewritten for TN5000 |
