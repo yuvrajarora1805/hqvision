@@ -265,9 +265,15 @@ def noisy_fidelity_gram(
 ) -> np.ndarray:
     """Fidelity Gram estimated on a depolarising AerSimulator with finite shots.
 
-    The feature map is transpiled to a hardware basis, every 1- and 2-qubit gate
-    gets an independent ``depolarizing_error``, and the |0000> probability is
-    estimated from ``shots`` samples.
+    Each entry is the fidelity |<psi(a)|psi(b)>|^2, estimated the way it has to be
+    on hardware: prepare U(a), then apply U(b)^dagger, and read the probability
+    of landing back on |0...0>.  Measuring a single bound state instead would give
+    P(|0...0>) of psi(b) only -- a different quantity whose rows do not depend on
+    ``a`` at all.
+
+    The transpiled circuit and its dagger are built once (the gate *structure* is
+    parameter-independent) and only the angles are re-bound per sample pair, so
+    the pair loop pays for binding and simulation, not for two transpiles each.
     """
     from qiskit_aer import AerSimulator
     from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -275,34 +281,42 @@ def noisy_fidelity_gram(
 
     basis = ["rz", "sx", "x", "cx"]
     compiled = transpile(circuit, basis_gates=basis, optimization_level=1, seed_transpiler=seed)
+    compiled_dagger = transpile(
+        circuit.inverse(), basis_gates=basis, optimization_level=1, seed_transpiler=seed
+    )
 
     noise = NoiseModel()
+    present = {inst.operation.name for inst in compiled.data}
     for gate in ("rz", "sx", "x"):
-        if gate in {inst.operation.name for inst in compiled.data}:
+        if gate in present:
             noise.add_all_qubit_quantum_error(depolarizing_error(error_rate, 1), [gate])
-    if "cx" in {inst.operation.name for inst in compiled.data}:
+    if "cx" in present:
         noise.add_all_qubit_quantum_error(depolarizing_error(error_rate, 2), ["cx"])
 
     simulator = AerSimulator(noise_model=noise)
     simulator.set_options(seed_simulator=seed)
 
     parameters = list(circuit.parameters)
+    zero_key = "0" * circuit.num_qubits
+
     circuits = []
     for a in A:
-        bound_a = circuit.assign_parameters(dict(zip(parameters, a)))
+        psi_a = compiled.assign_parameters(dict(zip(parameters, a)))
         for b in B:
-            bound_b = bound_a.assign_parameters(
-                {parameters[i]: b[i] for i in range(len(b))}
-            )
-            measured = bound_b.copy()
-            measured.measure_all()
-            circuits.append(measured)
+            psi_b = compiled_dagger.assign_parameters(dict(zip(parameters, b)))
+            interference = psi_a.compose(psi_b)
+            interference.measure_all()
+            circuits.append(interference)
 
     result = simulator.run(circuits, shots=shots).result()
     counts = result.get_counts()
-    # |0000> is rendered with spaces between registers by qiskit.
-    zero_key = " ".join("0" for _ in range(circuit.num_qubits))
+    if isinstance(counts, dict):  # a single circuit returns one dict, not a list
+        counts = [counts]
+    # Strip register separators so both "0000" and "0 0 0 0" style keys match.
     probs = np.array(
-        [c.get(zero_key, 0) / shots for c in counts]
+        [
+            sum(v for key, v in counts[i].items() if key.replace(" ", "") == zero_key) / shots
+            for i in range(len(circuits))
+        ]
     )
     return probs.reshape(len(A), len(B))
