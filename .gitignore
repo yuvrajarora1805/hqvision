@@ -1,1 +1,6 @@
 venv/
+*.pyc
+__pycache__/
+archive.zip
+Main data/
+data/processed/
