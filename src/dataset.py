@@ -1,199 +1,219 @@
-"""
-Phase 1: Patient-Isolated Ingestion & Partitioning Engine
-Parses DDTI dataset XMLs, extracts patient case numbers, nodule ROIs,
-and enforces an 80/20 patient-level stratified split to prevent data leakage.
+"""Phase 1: TN5000 ingestion, integrity audit and split assignment.
+
+TN5000 is a PASCAL-VOC dataset:
+    <root>/JPEGImages/NNNNNN.jpg     5,000 ultrasound frames
+    <root>/Annotations/NNNNNN.xml    one nodule bounding box + biopsy label
+    <root>/ImageSets/Main/*.txt      official train / val / test id lists
+
+Each XML carries a single <object> whose <name> is the ground-truth class
+(1 = malignant, 0 = benign, confirmed by FNA biopsy) and a <bndbox> giving the
+nodule region (xmin, ymin, xmax, ymax).
+
+Pipeline contract: every record keeps the keys ``case_id``, ``image_id``,
+``image_path``, ``label`` and ``polygons`` (the ROI as a closed polygon list),
+which is what src/mining.py consumes. The VOC rectangle is simply converted to
+its 4 corner points, so the miner works unchanged from the DDTI version.
 """
 
-import os
-import glob
-import json
+from __future__ import annotations
+
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Tuple, Optional
+from collections import Counter
+from pathlib import Path
+
 import numpy as np
-from sklearn.model_selection import StratifiedGroupKFold
+
+from . import config
 
 
-def parse_ddti_xml(xml_path: str) -> Optional[Dict]:
+# --- Parsing -----------------------------------------------------------------
+def bbox_to_polygon(bbox: tuple[int, int, int, int]) -> np.ndarray:
+    """(xmin, ymin, xmax, ymax) -> (4, 2) int32 corner polygon for fillPoly."""
+    x0, y0, x1, y1 = bbox
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.int32)
+
+
+def parse_voc_annotation(xml_path: Path) -> dict:
+    """Parse one TN5000 VOC XML into a flat record.
+
+    Raises ValueError on structurally unusable files so the audit can count them.
     """
-    Parses a single DDTI XML annotation file.
-    Returns:
-        Dict containing patient case info, calcification label, tirads,
-        and nodule boundary polygons per image, or None if invalid/skipped.
-    """
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-    except Exception as e:
-        return None
+    root = ET.parse(xml_path).getroot()
 
-    # Case / Patient identifier
-    num_elem = root.find("number")
-    if num_elem is None or not num_elem.text:
-        # Fallback to filename stem
-        base = os.path.splitext(os.path.basename(xml_path))[0]
-        patient_id = base.strip()
-    else:
-        patient_id = num_elem.text.strip()
+    filename = (root.findtext("filename") or xml_path.stem).strip()
+    image_id = Path(filename).stem
 
-    # Calcifications label
-    calc_elem = root.find("calcifications")
-    if calc_elem is None or calc_elem.text is None:
-        return None
+    size = root.find("size")
+    width = int(float(size.findtext("width"))) if size is not None and size.findtext("width") else 0
+    height = int(float(size.findtext("height"))) if size is not None and size.findtext("height") else 0
 
-    calc_text = calc_elem.text.strip().lower()
-    if calc_text == "microcalcifications":
-        label = 1
-    elif calc_text == "non":
-        label = 0
-    else:
-        # Skip macro, indeterminate, or blank
-        return None
+    objects = root.findall("object")
+    if not objects:
+        raise ValueError("no <object> element")
+    obj = objects[0]
 
-    # TIRADS & other clinical features
-    tirads_elem = root.find("tirads")
-    tirads = tirads_elem.text.strip() if (tirads_elem is not None and tirads_elem.text) else "unknown"
+    raw_label = (obj.findtext("name") or "").strip()
+    if raw_label not in config.LABEL_MAP:
+        raise ValueError(f"unexpected class label {raw_label!r}")
+    label = config.LABEL_MAP[raw_label]
 
-    # Extract nodule polygon boundaries per image index
-    # DDTI format: <mark><image>1</image><svg>[{"points": [{"x":..,"y":..}]}]</svg></mark>
-    nodules_by_image = {}
-    for mark in root.findall("mark"):
-        img_elem = mark.find("image")
-        svg_elem = mark.find("svg")
-        if img_elem is None or img_elem.text is None:
-            continue
-        if svg_elem is None or svg_elem.text is None:
-            continue
+    box = obj.find("bndbox")
+    if box is None:
+        raise ValueError("no <bndbox> element")
+    xmin = int(round(float(box.findtext("xmin"))))
+    ymin = int(round(float(box.findtext("ymin"))))
+    xmax = int(round(float(box.findtext("xmax"))))
+    ymax = int(round(float(box.findtext("ymax"))))
 
-        img_idx = img_elem.text.strip()
-        try:
-            regions = json.loads(svg_elem.text)
-        except Exception:
-            continue
-
-        polygons = []
-        for region in regions:
-            pts = region.get("points", [])
-            if len(pts) >= 3:
-                poly = [[int(round(p["x"])), int(round(p["y"]))] for p in pts if "x" in p and "y" in p]
-                if len(poly) >= 3:
-                    polygons.append(np.array(poly, dtype=np.int32))
-
-        if polygons:
-            if img_idx not in nodules_by_image:
-                nodules_by_image[img_idx] = []
-            nodules_by_image[img_idx].extend(polygons)
-
-    if not nodules_by_image:
-        return None
+    # Clamp to the declared image size; some releases ship 1-based boxes.
+    if width and height:
+        xmin, xmax = sorted((max(0, min(xmin, width - 1)), max(0, min(xmax, width - 1))))
+        ymin, ymax = sorted((max(0, min(ymin, height - 1)), max(0, min(ymax, height - 1))))
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError(f"degenerate bbox ({xmin},{ymin},{xmax},{ymax})")
 
     return {
-        "patient_id": patient_id,
+        "case_id": image_id,
+        "image_id": image_id,
+        "filename": filename,
         "label": label,
-        "calcification_str": calc_text,
-        "tirads": tirads,
-        "nodules": nodules_by_image,
-        "xml_path": xml_path
+        "class_name": raw_label,
+        "bbox": (xmin, ymin, xmax, ymax),
+        "width": width,
+        "height": height,
+        "n_objects": len(objects),
+        "xml_path": str(xml_path),
     }
 
 
-def collect_ddti_dataset(data_dir: str) -> List[Dict]:
-    """
-    Scans data directory, matches XMLs with available JPEG images,
-    and returns a clean structured record for each patient-image sample.
-    """
-    records = []
-    xml_files = sorted(glob.glob(os.path.join(data_dir, "*.xml")))
+# --- Collection & audit ------------------------------------------------------
+def collect_tn5000_records(verbose: bool = True) -> list[dict]:
+    """Pair every XML with its JPEG and return usable records (audit + records)."""
+    image_dir, annotation_dir = config.IMAGE_DIR, config.ANNOTATION_DIR
+    if not image_dir.is_dir() or not annotation_dir.is_dir():
+        raise FileNotFoundError(
+            f"TN5000 folders missing under {config.DATASET_DIR} "
+            "(expected JPEGImages/ and Annotations/)"
+        )
 
-    for xml_path in xml_files:
-        parsed = parse_ddti_xml(xml_path)
-        if parsed is None:
+    xml_by_stem = {p.stem: p for p in sorted(annotation_dir.glob("*.xml"))}
+    jpg_stems = {p.stem for p in sorted(image_dir.glob("*.jpg"))}
+
+    xml_without_image = sorted(set(xml_by_stem) - jpg_stems)
+    image_without_xml = sorted(jpg_stems - set(xml_by_stem))
+
+    records: list[dict] = []
+    failures: Counter[str] = Counter()
+    label_counts: Counter[int] = Counter()
+    n_objects = Counter()
+
+    for stem, xml_path in sorted(xml_by_stem.items()):
+        if stem not in jpg_stems:
+            continue
+        try:
+            record = parse_voc_annotation(xml_path)
+        except ET.ParseError:
+            failures["unparseable_xml"] += 1
+            continue
+        except ValueError as exc:
+            failures[str(exc).split(":")[0]] += 1
             continue
 
-        patient_id = parsed["patient_id"]
-        for img_idx, polygons in parsed["nodules"].items():
-            # DDTI images typically follow: [patient_id]_[img_idx].jpg
-            candidate_img_paths = [
-                os.path.join(data_dir, f"{patient_id}_{img_idx}.jpg"),
-                os.path.join(data_dir, f"{patient_id}_{img_idx}.JPG"),
-                os.path.join(data_dir, f"{patient_id}.jpg")
-            ]
-            
-            matched_img = None
-            for p in candidate_img_paths:
-                if os.path.exists(p):
-                    matched_img = p
-                    break
+        record["image_path"] = str(image_dir / f"{stem}.jpg")
+        record["polygons"] = [bbox_to_polygon(record["bbox"])]
+        records.append(record)
+        label_counts[record["label"]] += 1
+        n_objects[record["n_objects"]] += 1
 
-            if matched_img is not None:
-                records.append({
-                    "patient_id": patient_id,
-                    "image_id": f"{patient_id}_{img_idx}",
-                    "image_path": matched_img,
-                    "xml_path": xml_path,
-                    "label": parsed["label"],
-                    "tirads": parsed["tirads"],
-                    "polygons": polygons
-                })
+    if verbose:
+        print("\n=== TN5000 Dataset Integrity Report ===")
+        print(f"  XML annotations scanned        : {len(xml_by_stem)}")
+        print(f"  JPEG images on disk            : {len(jpg_stems)}")
+        print(f"  Usable records                 : {len(records)}")
+        print(f"    malignant (label 1)          : {label_counts[config.LABEL_MALIGNANT]}")
+        print(f"    benign    (label 0)          : {label_counts[config.LABEL_BENIGN]}")
+        print(f"  XML without matching image     : {len(xml_without_image)} {xml_without_image[:5]}")
+        print(f"  Image without matching XML     : {len(image_without_xml)} {image_without_xml[:5]}")
+        if failures:
+            print(f"  Rejected annotations           : {dict(failures)}")
+        print(f"  Objects per annotation         : {dict(sorted(n_objects.items()))}")
+        print(f"  Dataset root                   : {config.DATASET_DIR}")
 
     return records
 
 
-def get_patient_stratified_split(
-    records: List[Dict],
-    test_size: float = 0.2,
-    random_state: int = 42
-) -> Tuple[List[Dict], List[Dict]]:
+# --- Official split ----------------------------------------------------------
+def load_split_ids(split_name: str) -> set[str] | None:
+    """Read ImageSets/Main/<split>.txt; returns None when unavailable."""
+    path = config.IMAGESETS_DIR / f"{split_name}.txt"
+    if not path.is_file():
+        return None
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def assign_splits(
+    records: list[dict],
+    use_official: bool = config.USE_OFFICIAL_SPLIT,
+    test_fraction: float = config.FALLBACK_TEST_FRACTION,
+    seed: int = config.SEED,
+    verbose: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """Split records into (train, test).
+
+    Preferred: the official TN5000 ImageSets (trainval/test), which the dataset
+    authors built by keeping one representative image per patient perspective --
+    i.e. the leakage-safe partition ships with the data. Fallback: a seeded
+    stratified 80/20 image-level split when ImageSets/ is absent.
     """
-    Strict Patient-Isolated Stratified Split:
-    Ensures ZERO patient tissue patterns cross between train and test splits,
-    while maintaining class balance (label 0 vs label 1).
-    """
-    patient_map = {}
-    for r in records:
-        pid = r["patient_id"]
-        if pid not in patient_map:
-            patient_map[pid] = {
-                "label": r["label"],
-                "records": []
-            }
-        patient_map[pid]["records"].append(r)
+    if use_official:
+        train_ids = load_split_ids(config.TRAIN_SPLIT_NAME)
+        test_ids = load_split_ids(config.TEST_SPLIT_NAME)
+        if train_ids and test_ids:
+            train = [r for r in records if r["case_id"] in train_ids]
+            test = [r for r in records if r["case_id"] in test_ids]
+            source = f"official {config.TRAIN_SPLIT_NAME}/{config.TEST_SPLIT_NAME}.txt"
+        else:
+            use_official = False
 
-    patient_ids = np.array(list(patient_map.keys()))
-    labels = np.array([patient_map[pid]["label"] for pid in patient_ids])
-    groups = patient_ids  # Group by patient ID
+    if not use_official:
+        rng = np.random.default_rng(seed)
+        train, test = [], []
+        for label in sorted({r["label"] for r in records}):
+            group = sorted((r for r in records if r["label"] == label), key=lambda r: r["case_id"])
+            order = rng.permutation(len(group))
+            n_test = max(1, int(round(len(group) * test_fraction)))
+            test_idx = set(order[:n_test].tolist())
+            for i, record in enumerate(group):
+                (test if i in test_idx else train).append(record)
+        source = f"stratified fallback ({int((1 - test_fraction) * 100)}/{int(test_fraction * 100)}, seed {seed})"
 
-    # Use StratifiedGroupKFold to get an 80/20 split (5 folds -> 1 test fold)
-    n_splits = int(round(1.0 / test_size))
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    overlap = {r["case_id"] for r in train} & {r["case_id"] for r in test}
+    assert not overlap, f"Split leakage: {sorted(overlap)[:5]}"
 
-    train_indices, test_indices = next(sgkf.split(patient_ids, labels, groups=groups))
+    if verbose:
+        def _counts(recs):
+            c = Counter(r["label"] for r in recs)
+            return (
+                f"{len(recs)} images | malignant={c[config.LABEL_MALIGNANT]} "
+                f"benign={c[config.LABEL_BENIGN]}"
+            )
 
-    train_patients = set(patient_ids[train_indices])
-    test_patients = set(patient_ids[test_indices])
+        print("\n=== Split ===")
+        print(f"  source  : {source}")
+        print(f"  train   : {_counts(train)}")
+        print(f"  test    : {_counts(test)}")
+        print(f"  overlap : {len(overlap)} (must be 0)")
 
-    # Assert strict disjointness
-    assert len(train_patients.intersection(test_patients)) == 0, "Patient leakage detected!"
+    return train, test
 
-    train_records = [r for r in records if r["patient_id"] in train_patients]
-    test_records = [r for r in records if r["patient_id"] in test_patients]
 
-    return train_records, test_records
+def load_dataset(verbose: bool = True, **split_kwargs) -> tuple[list[dict], list[dict]]:
+    """One-call helper: integrity audit + split assignment."""
+    records = collect_tn5000_records(verbose=verbose)
+    if not records:
+        raise RuntimeError("TN5000 yielded no usable records.")
+    return assign_splits(records, verbose=verbose, **split_kwargs)
 
 
 if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_path = os.path.join(current_dir, "data")
-    print(f"Loading DDTI dataset from: {data_path}")
-    recs = collect_ddti_dataset(data_path)
-    print(f"Total valid image-nodule records: {len(recs)}")
-
-    if recs:
-        train_recs, test_recs = get_patient_stratified_split(recs, test_size=0.2)
-        train_p = set(r["patient_id"] for r in train_recs)
-        test_p = set(r["patient_id"] for r in test_recs)
-        train_labels = [r["label"] for r in train_recs]
-        test_labels = [r["label"] for r in test_recs]
-
-        print(f"Train samples: {len(train_recs)} from {len(train_p)} unique patients (Microcalc: {sum(train_labels)}, Non: {len(train_labels)-sum(train_labels)})")
-        print(f"Test samples:  {len(test_recs)} from {len(test_p)} unique patients (Microcalc: {sum(test_labels)}, Non: {len(test_labels)-sum(test_labels)})")
-        print(f"Patient overlap check: {len(train_p.intersection(test_p))} (Must be 0)")
+    load_dataset(verbose=True)

@@ -3,9 +3,13 @@ Phase 2: Classical Candidate Mining (High-Recall Sieve)
 Performs:
   1. CLAHE Adaptive Contrast Normalization (clipLimit=2.0, grid=8x8)
   2. Morphological Top-Hat Transform (5x5 Elliptical kernel)
-  3. ROI Polygon Masking (isolates nodule, suppresses background tissue)
+  3. Nodule ROI Masking (isolates the TN5000 nodule bbox, suppresses background)
   4. Local Weber Contrast Peak Detection & Non-Maximum Suppression (NMS, R=4 px)
   5. Native Micro-Patch Extraction (4x4 patches, 16 raw features)
+
+The ROI comes from the TN5000 VOC <bndbox> (converted to a 4-corner polygon by
+src/dataset.py), so everything downstream is unchanged from the polygon-based
+version of the pipeline.
 """
 
 import cv2
@@ -15,7 +19,8 @@ from typing import List, Tuple, Dict, Optional
 
 class CandidateMiner:
     """
-    Classical High-Recall Candidate Miner for Ultrasound Microcalcifications.
+    Classical High-Recall Candidate Miner for bright punctate foci inside a
+    thyroid nodule ROI (TN5000 bounding box).
     """
     def __init__(
         self,
@@ -43,7 +48,11 @@ class CandidateMiner:
         return cv2.morphologyEx(enhanced_img, cv2.MORPH_TOPHAT, self.tophat_kernel)
 
     def create_nodule_mask(self, image_shape: Tuple[int, int], polygons: List[np.ndarray]) -> np.ndarray:
-        """Creates a binary mask (255 inside nodule, 0 outside) from XML polygon boundaries."""
+        """Creates a binary mask (255 inside nodule, 0 outside).
+
+        ``polygons`` are ROI outlines; for TN5000 this is the 4-corner polygon
+        of the annotated nodule bounding box.
+        """
         mask = np.zeros(image_shape, dtype=np.uint8)
         if polygons:
             cv2.fillPoly(mask, polygons, 255)
@@ -207,11 +216,12 @@ class CandidateMiner:
 
 def build_candidate_dataset(records: List[Dict], miner: CandidateMiner) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
     """
-    Extracts all candidate patches across a set of patient records.
+    Extracts all candidate patches across a set of TN5000 image records.
     Returns:
         X: (N_patches, 16) array of flattened 4x4 raw pixel values
-        y: (N_patches,) array of labels (1: microcalcification nodule spot, 0: non-calcification speckle)
-        meta: list of metadata dicts tracking originating patient and coordinates
+        y: (N_patches,) weak labels inherited from the nodule
+           (1: malignant nodule spot, 0: benign nodule spot)
+        meta: list of metadata dicts tracking originating image and coordinates
     """
     X_list = []
     y_list = []
@@ -227,9 +237,10 @@ def build_candidate_dataset(records: List[Dict], miner: CandidateMiner) -> Tuple
             X_list.append(p.flatten().astype(np.float32))
             y_list.append(r["label"])
             meta_list.append({
-                "patient_id": r["patient_id"],
+                "case_id": r["case_id"],
                 "image_id": r["image_id"],
                 "coord": (cy, cx),
+                "bbox": r["bbox"],
                 "label": r["label"]
             })
 
@@ -240,20 +251,16 @@ def build_candidate_dataset(records: List[Dict], miner: CandidateMiner) -> Tuple
 
 
 if __name__ == "__main__":
-    from dataset import collect_ddti_dataset, get_patient_stratified_split
     import os
+    from src.dataset import load_dataset
 
-    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_path = os.path.join(current_dir, "data")
-    recs = collect_ddti_dataset(data_path)
-    train_recs, test_recs = get_patient_stratified_split(recs, test_size=0.2)
-
+    train_recs, test_recs = load_dataset(verbose=True)
     miner = CandidateMiner(patch_size=4, max_candidates=5)
 
-    print("Extracting candidate patches from Train split...")
-    X_train, y_train, meta_train = build_candidate_dataset(train_recs, miner)
-    print(f"X_train shape: {X_train.shape} (Patches, 16 dims), Class distribution: Microcalc={np.sum(y_train==1)}, Speckle={np.sum(y_train==0)}")
-
-    print("Extracting candidate patches from Test split...")
-    X_test, y_test, meta_test = build_candidate_dataset(test_recs, miner)
-    print(f"X_test shape:  {X_test.shape} (Patches, 16 dims), Class distribution: Microcalc={np.sum(y_test==1)}, Speckle={np.sum(y_test==0)}")
+    for name, recs in (("Train", train_recs), ("Test", test_recs)):
+        X, y, meta = build_candidate_dataset(recs, miner)
+        print(
+            f"{name}: X={X.shape} (patches, 16 dims) | "
+            f"malignant={int(np.sum(y == 1))} benign={int(np.sum(y == 0))} | "
+            f"images mined={len({m['case_id'] for m in meta})}/{len(recs)}"
+        )

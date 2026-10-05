@@ -1,8 +1,14 @@
-"""Module 4: clinical inference, visual overlay and TI-RADS re-scoring.
+"""Module 4: clinical inference, overlay and nodule-level verdict.
 
-Consumes a raw scan plus its ROI annotations, runs the classical miner and the
-quantum verifier, and produces the two things a capstone actually has to
-deliver: an annotated clinical image and a re-scored suspicion category.
+Consumes a TN5000 image plus its nodule bounding box, runs the classical miner
+inside that ROI and the quantum verifier on the mined patches, then produces
+the two deliverables a capstone has to ship: an annotated clinical image and a
+single suspicion verdict for the nodule.
+
+TN5000 carries no TI-RADS / composition / echogenicity annotations (the biopsy
+label is the only ground truth), so the DDTI-era TI-RADS re-scoring is replaced
+by an explicit nodule verdict: majority vote over the K mined patches plus the
+mean signed kernel margin.
 """
 
 from __future__ import annotations
@@ -14,134 +20,61 @@ import cv2
 import numpy as np
 
 from . import config
-from .dataset import PatchRecord, Region
-from .mining import Candidate, CandidateMiner
-
-# --- ACR TI-RADS component scores -------------------------------------------
-# Mapped from the free-text values that appear in the DDTI XML annotations.
-_COMPOSITION_POINTS = {
-    "cystic": 0,
-    "spongiform": 0,
-    "predominantly cystic": 1,
-    "dense": 2,
-    "predominantly solid": 2,
-    "solid": 2,
-}
-_ECHOGENICITY_POINTS = {
-    "isoechogenicity": 1,
-    "hyperechogenicity": 1,
-    "hypoechogenicity": 1,
-    "marked hypoechogenicity": 2,
-    "anechoic": 0,
-}
-_MARGIN_POINTS = {
-    "well defined": 0,
-    "well defined smooth": 0,
-    "ill defined": 0,
-    "ill- defined": 0,
-    "microlobulated": 2,
-    "macrolobulated": 2,
-    "spiculated": 3,
-}
-
-# DDTI stores the 2017 ACR scheme (2, 3, 4a, 4b, 4c, 5); the current standard is
-# TR1-TR5. Mapping both lets the re-scored output be validated against the
-# radiologist's recorded category.
-_XML_TIRADS_TO_TR = {
-    "1": "TR1", "2": "TR2", "3": "TR3",
-    "4a": "TR4", "4b": "TR4", "4c": "TR5", "5": "TR5",
-}
+from .dataset import bbox_to_polygon
+from .mining import CandidateMiner
 
 
-def _points_to_category(points: int) -> str:
-    if points <= 1:
-        return "TR2"
-    if points <= 3:
-        return "TR3"
-    if points <= 5:
-        return "TR4"
-    return "TR5"
-
-
-_RECOMMENDATION = {
-    "TR1": "No follow-up.",
-    "TR2": "No follow-up.",
-    "TR3": "Follow-up ultrasound in 1 year.",
-    "TR4": "Ultrasound-guided FNA; consider molecular testing.",
-    "TR5": "Ultrasound-guided FNA; high suspicion of malignancy.",
-}
-
-
+# --- Nodule-level decision ---------------------------------------------------
 @dataclass
-class TIRADSScore:
-    """A re-scored suspicion category with its provenance."""
+class NoduleVerdict:
+    """Majority decision over the patches mined from one nodule."""
 
-    points: int
-    category: str
-    recommendation: str
-    base_points: int = 0
-    microcalc_points: int = 0
-    xml_category: str | None = None
+    n_patches: int
+    n_malignant: int
+    n_benign: int
+    mean_score: float
+    label: int  # config.LABEL_MALIGNANT or config.LABEL_BENIGN
+
+    @property
+    def confidence(self) -> float:
+        """Fraction of patches agreeing with the verdict (0.5 = coin flip)."""
+        if self.n_patches == 0:
+            return 0.0
+        return max(self.n_malignant, self.n_benign) / self.n_patches
+
+    @property
+    def name(self) -> str:
+        return config.CLASS_NAMES[self.label]
 
     def describe(self) -> str:
-        parts = [
-            f"{self.category} ({self.points} pts: base {self.base_points} "
-            f"+ microcalc {self.microcalc_points})"
-        ]
-        parts.append(f"-> {self.recommendation}")
-        if self.xml_category:
-            match = "matches" if self.xml_category == self.category else "differs from"
-            parts.append(f"| radiologist {self.xml_category} ({match} re-score)")
-        return " ".join(parts)
+        return (
+            f"{self.name.upper()} ({self.n_malignant}/{self.n_patches} malignant patches, "
+            f"mean margin {self.mean_score:+.3f})"
+        )
 
 
-def acr_base_score(case) -> int:
-    """ACR TI-RADS points from composition, echogenicity and margins.
+def nodule_verdict(labels: list[int], scores: list[float]) -> NoduleVerdict:
+    """Aggregate patch predictions into one decision for the nodule.
 
-    Calcifications are deliberately excluded here: that is exactly the
-    contribution this system is being evaluated on, so it must be added
-    separately rather than read from the annotation.
+    Ties (even patch counts split evenly) resolve to the higher mean margin,
+    falling back to benign -- the conservative choice when the kernel is
+    undecided.
     """
-    if case is None:
-        return 0
-    total = 0
-    for value, table in (
-        (case.composition, _COMPOSITION_POINTS),
-        (case.echogenicity, _ECHOGENICITY_POINTS),
-        (case.margins, _MARGIN_POINTS),
-    ):
-        if value:
-            total += table.get(str(value).strip().lower(), 0)
-    return total
+    labels = [int(v) for v in labels]
+    n = len(labels)
+    n_mal = sum(1 for v in labels if v == config.LABEL_MALIGNANT)
+    n_ben = n - n_mal
+    mean_score = float(np.mean(scores)) if scores else 0.0
 
-
-def ti_rads_rescore(
-    n_microcalcifications: int,
-    case=None,
-    base_points: int | None = None,
-) -> TIRADSScore:
-    """Re-score a nodule given the number of quantum-verified microcalcifications.
-
-    Follows plan.md: one or more verified microcalcifications add points and
-    elevate suspicion; if every candidate is classified as speckle, nothing is
-    added, which is what prevents an unnecessary biopsy recommendation.
-    """
-    if base_points is None:
-        base_points = acr_base_score(case)
-    microcalc_points = (
-        config.TI_RADS_MICROCALC_POINTS if n_microcalcifications >= 1 else 0
-    )
-    total = base_points + microcalc_points
-    xml_category = None
-    if case is not None and getattr(case, "tirads", None):
-        xml_category = _XML_TIRADS_TO_TR.get(str(case.tirads).strip().lower())
-    return TIRADSScore(
-        points=total,
-        category=_points_to_category(total),
-        recommendation=_RECOMMENDATION[_points_to_category(total)],
-        base_points=base_points,
-        microcalc_points=microcalc_points,
-        xml_category=xml_category,
+    if n_mal > n_ben:
+        label = config.LABEL_MALIGNANT
+    elif n_ben > n_mal:
+        label = config.LABEL_BENIGN
+    else:
+        label = config.LABEL_MALIGNANT if mean_score > 0 else config.LABEL_BENIGN
+    return NoduleVerdict(
+        n_patches=n, n_malignant=n_mal, n_benign=n_ben,
+        mean_score=mean_score, label=label,
     )
 
 
@@ -151,22 +84,27 @@ class InferenceResult:
     """Quantum-verified classification of every mined candidate in one frame."""
 
     image_path: Path
-    candidates: list[Candidate]
+    candidates: list[tuple[int, int]]  # (x, y) patch centres
     labels: list[int]
     scores: list[float]
-    regions: list[Region] = field(default_factory=list)
+    bbox: tuple[int, int, int, int] | None = None
+    patches: list[np.ndarray] = field(default_factory=list)
 
     @property
     def n_candidates(self) -> int:
         return len(self.candidates)
 
     @property
-    def n_microcalcifications(self) -> int:
-        return int(sum(1 for label in self.labels if label == config.LABEL_MICROCALC))
+    def n_malignant(self) -> int:
+        return int(sum(1 for v in self.labels if v == config.LABEL_MALIGNANT))
 
     @property
-    def n_speckles(self) -> int:
-        return int(sum(1 for label in self.labels if label == config.LABEL_SPECKLE))
+    def n_benign(self) -> int:
+        return int(sum(1 for v in self.labels if v == config.LABEL_BENIGN))
+
+    @property
+    def verdict(self) -> NoduleVerdict:
+        return nodule_verdict(self.labels, self.scores)
 
 
 class ThyroidCADPipeline:
@@ -174,50 +112,59 @@ class ThyroidCADPipeline:
 
     def __init__(self, model, miner: CandidateMiner | None = None) -> None:
         self.model = model
-        self.miner = miner or CandidateMiner()
+        self.miner = miner or CandidateMiner(
+            patch_size=config.PATCH_SIZE, max_candidates=config.MAX_CANDIDATES
+        )
 
-    def analyse(self, image_path: Path, regions: list[Region]) -> InferenceResult:
-        candidates = self.miner.mine_batch(image_path, regions)
-        if not candidates:
+    def analyse(
+        self, image_path: Path, bbox: tuple[int, int, int, int]
+    ) -> InferenceResult:
+        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image: {image_path}")
+
+        polygons = [bbox_to_polygon(bbox)]
+        patches, coords = self.miner.mine_candidates(img, polygons)
+        if not patches:
             return InferenceResult(
-                image_path=image_path, candidates=[], labels=[], scores=[], regions=regions
+                image_path=image_path, candidates=[], labels=[],
+                scores=[], bbox=bbox,
             )
 
-        X = np.array([c.flat for c in candidates], dtype=np.float64)
+        X = np.array([p.flatten() for p in patches], dtype=np.float64)
         gram = self.model.test_gram(X)
         labels = self.model.predict_from_gram(gram)
         scores = self.model.decision_from_gram(gram)
         return InferenceResult(
             image_path=image_path,
-            candidates=candidates,
-            labels=[int(label) for label in labels],
-            scores=[float(score) for score in scores],
-            regions=regions,
+            candidates=[(int(x), int(y)) for y, x in coords],
+            labels=[int(v) for v in labels],
+            scores=[float(v) for v in scores],
+            bbox=bbox,
+            patches=patches,
         )
 
 
 def predict_image(
     model,
     image_path: Path,
-    regions: list[Region],
+    bbox: tuple[int, int, int, int],
     miner: CandidateMiner | None = None,
 ) -> InferenceResult:
     """Functional wrapper around :class:`ThyroidCADPipeline`."""
-    return ThyroidCADPipeline(model=model, miner=miner).analyse(image_path, regions)
+    return ThyroidCADPipeline(model=model, miner=miner).analyse(image_path, bbox)
 
 
 # --- Visualisation -----------------------------------------------------------
-def _draw_legend(
-    canvas: np.ndarray,
-    result: InferenceResult,
-    score: TIRADSScore,
-) -> None:
+def _draw_legend(canvas: np.ndarray, result: InferenceResult) -> None:
+    verdict = result.verdict
     lines = [
-        "Quantum-Assisted CAD",
+        "Quantum-Assisted Thyroid CAD",
         f"  candidates mined : {result.n_candidates}",
-        f"  microcalc (red)  : {result.n_microcalcifications}",
-        f"  speckle  (green) : {result.n_speckles}",
-        f"  TI-RADS          : {score.describe()}",
+        f"  malignant (red)  : {result.n_malignant}",
+        f"  benign    (green): {result.n_benign}",
+        f"  verdict          : {verdict.describe()}",
+        f"  confidence       : {verdict.confidence:.0%}",
     ]
     font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
     pad, line_h = 10, 18
@@ -244,34 +191,30 @@ def render_overlay(
     image_path: Path,
     result: InferenceResult,
     output_path: Path,
-    base_tirads: str | None = None,
     radius: int = 9,
 ) -> Path:
-    """Render the clinical overlay: yellow ROI, red microcalc, green speckle."""
+    """Render the clinical overlay: yellow ROI, red malignant, green benign."""
     canvas = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if canvas is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
-    for region in result.regions:
-        cv2.polylines(
-            canvas, [region.as_poly()], isClosed=True,
-            color=config.COLOR_NODULE, thickness=1,
-        )
+    if result.bbox is not None:
+        x0, y0, x1, y1 = result.bbox
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), config.COLOR_ROI, 1, cv2.LINE_AA)
 
-    for candidate, label in zip(result.candidates, result.labels):
-        is_micro = label == config.LABEL_MICROCALC
-        colour = config.COLOR_MICROCALC if is_micro else config.COLOR_SPECKLE
+    for (x, y), label in zip(result.candidates, result.labels):
+        is_malignant = label == config.LABEL_MALIGNANT
+        colour = config.COLOR_MALIGNANT if is_malignant else config.COLOR_BENIGN
         # Filled dot plus ring: readable at 4x4 native patch size.
-        cv2.circle(canvas, (candidate.x, candidate.y), radius, colour, 1, cv2.LINE_AA)
-        if is_micro:
-            cv2.circle(canvas, (candidate.x, candidate.y), 1, colour, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), radius, colour, 1, cv2.LINE_AA)
+        if is_malignant:
+            cv2.circle(canvas, (x, y), 1, colour, -1, cv2.LINE_AA)
             cv2.drawMarker(
-                canvas, (candidate.x, candidate.y), colour,
-                cv2.MARKER_CROSS, 4, 1, cv2.LINE_AA,
+                canvas, (x, y), colour, cv2.MARKER_CROSS, 4, 1, cv2.LINE_AA
             )
 
-    score = ti_rads_rescore(result.n_microcalcifications)
-    _draw_legend(canvas, result, score)
+    if result.n_candidates:
+        _draw_legend(canvas, result)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_path), canvas)

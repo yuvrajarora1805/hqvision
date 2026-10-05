@@ -1,78 +1,104 @@
 
 ---
 
-# Complete Capstone Blueprint: Quantum-Assisted Thyroid Microcalcification Detection System
+# Complete Capstone Blueprint: Quantum-Assisted Thyroid Nodule Malignancy Classifier
 
 ```
                          [ FULL END-TO-END SYSTEM ]
 
-    Raw Patient Scan (.jpg) 
+    Raw Ultrasound Frame (.jpg) + nodule box (.xml)
               │
               ▼
     ┌────────────────────────────────────────┐
-    │  MODULE 1: Macro ROI & Candidate Mining│  ◄── Classical OpenCV
-    │  • Nodule Localization (XML or YOLO)  │
-    │  • Top-Hat Saliency + NMS Filter       │
+    │  MODULE 1: Data Sieve & Split          │  ◄── TN5000 (VOC)
+    │  • Parse bbox + biopsy label (1/0)     │
+    │  • Official trainval/test split        │
     └──────────────────┬─────────────────────┘
-                       │ Extracts N Candidate Patches (4x4)
+                       │ 4000 train / 1000 test images
                        ▼
     ┌────────────────────────────────────────┐
-    │  MODULE 2: Quantum Verification Engine │  ◄── Qiskit 1.x
-    │  • Train-Fitted PCA (16 ──► 4 dims)    │
-    │  • ZZFeatureMap Quantum State Prep     │
-    │  • Symmetric Kernel Evaluation (QSVC)  │
+    │  MODULE 2: Classical Candidate Mining  │  ◄── Classical OpenCV
+    │  • CLAHE + Top-Hat saliency + NMS      │
+    │  • ROI = nodule bounding box           │
     └──────────────────┬─────────────────────┘
-                       │ Classifies each spot: Real (1) vs Speckle (0)
+                       │ Extracts up to K candidate patches (4x4)
                        ▼
     ┌────────────────────────────────────────┐
-    │  MODULE 3: Clinical Decision & Overlay │  ◄── Output Engine
-    │  • Annotates scan (Green=Speckle, Red=Real)
-    │  • Recalculates TI-RADS Risk Category  │
+    │  MODULE 3: Quantum Verification Engine │  ◄── Qiskit 2.x
+    │  • Train-fitted PCA (16 ──► 4 dims)    │
+    │  • ZZFeatureMap quantum state prep     │
+    │  • Symmetric kernel evaluation (SVC)   │
+    └──────────────────┬─────────────────────┘
+                       │ Classifies each patch: malignant (1) vs benign (0)
+                       ▼
+    ┌────────────────────────────────────────┐
+    │  MODULE 4: Clinical Decision & Overlay │  ◄── Output Engine
+    │  • Annotates scan (red = malignant)    │
+    │  • Majority-vote verdict per nodule    │
     └──────────────────┬─────────────────────┘
                        │
                        ▼
     ┌────────────────────────────────────────┐
-    │  MODULE 4: Research Benchmarking Suite │  ◄── Viva / Paper Proof
+    │  MODULE 5: Research Benchmarking Suite │  ◄── Viva / Paper Proof
     │  • Sample-Efficiency Curves            │
-    │  • Qiskit Aer Noise Hardware Modeling  │
+    │  • Qiskit Aer noise hardware modeling  │
     │  • Classical Baseline Comparisons      │
     └────────────────────────────────────────┘
 ```
 
+**Dataset:** TN5000 (Nature Scientific Data, 2025) — 5,000 thyroid ultrasound
+frames, one nodule bounding box per image, biopsy-confirmed label per nodule:
+`<name>1</name>` = malignant (3,574), `<name>0</name>` = benign (1,426).
+PASCAL-VOC layout: `JPEGImages/`, `Annotations/`, `ImageSets/Main/{train,val,test,trainval}.txt`.
+
+> Why not DDTI: DDTI has ~480 annotated frames with TI-RADS/calcification text tags —
+> too few samples to train or evaluate honestly, and no biopsy ground truth.
+> TN5000 gives 10x the data with a confirmed label and a leakage-safe published split.
+
 ---
 
-## Module 1: Data Pipeline & Patient-Isolated Partitioning
+## Module 1: Data Pipeline & Split Hygiene
 
-A common failure in medical AI capstones is data leakage between images belonging to the same patient.
+A common failure in medical AI capstones is data leakage between images of the same
+patient.
 
 ### Implementation Tasks
-1. **Dataset Integrity Checker:**
-   * Script to parse all DDTI XMLs and flag missing images, corrupted coordinates, or empty nodule tags.
-   * Map labels: `<calcifications>microcalcifications</calcifications>` $\to 1$, `<calcifications>non</calcifications>` $\to 0$. Exclude ambiguous/macro entries.
-2. **Patient-Wise Stratified Splitter:**
-   * Extract unique patient prefixes (e.g., patient `106` might have images `106_1.jpg`, `106_2.jpg`).
-   * Perform an **$80/20$ patient-level split** using `GroupKFold` or hash partitioning so that zero patient tissue patterns cross between train and test splits.
+1. **Dataset Integrity Checker** (`main.py integrity`):
+   * Parse all 5,000 VOC XMLs; flag missing images, missing XMLs, corrupt boxes, unexpected labels.
+   * Label map: `<name>1</name>` → 1 (malignant), `<name>0</name>` → 0 (benign). Nothing else is accepted.
+2. **Official Split** (`ImageSets/Main`):
+   * `trainval.txt` (4,000 images) → training, `test.txt` (1,000) → test; overlap asserted to be 0.
+   * The TN5000 authors kept one representative image per patient perspective when building this
+     split — i.e. the leakage-safe partition ships with the data, so we use it rather than rolling
+     our own. Fallback: seeded stratified 80/20 only if `ImageSets/` is absent.
 
 ---
 
 ## Module 2: Classical Candidate Mining (High-Recall Sieve)
 
-The goal of this stage is to extract candidate spots with **$\ge 95\%$ recall**, ensuring true calcifications are almost never discarded upfront.
+The goal of this stage is to extract candidate spots with **≥ 95% recall**,
+ensuring true suspicious foci are almost never discarded upfront.
 
 ### Implementation Tasks
 1. **Adaptive Contrast Normalization (CLAHE):**
-   * Apply CLAHE (`clipLimit=2.0`, grid size $8 \times 8$) to normalize acoustic attenuation across different depths.
+   * Apply CLAHE (`clipLimit=2.0`, grid size 8×8) to normalize acoustic attenuation across depths.
 2. **Morphological Extraction:**
-   * Apply morphological Top-Hat transformation using an elliptical structuring element matching sub-millimeter geometry ($\approx 5 \times 5$ pixels).
+   * Top-Hat transform with an elliptical structuring element matching sub-millimeter
+     geometry (≈ 5×5 pixels).
 3. **Region Masking:**
-   * Mask out everything outside the nodule boundaries (neck muscle, carotid artery, trachea).
+   * Mask out everything outside the nodule bounding box (neck muscle, carotid artery, trachea).
 4. **Non-Maximum Suppression (NMS):**
-   * Suppress secondary peaks within a radius of $R = 4\text{ pixels}$.
+   * Suppress secondary peaks within a radius of R = 4 pixels.
    * Sort remaining peaks by local Weber contrast score:
      $$C = \frac{I_{\text{peak}} - I_{\text{background}}}{I_{\text{background}} + \epsilon}$$
-   * Retain the top $K$ candidate coordinates ($K=4$ or $5$).
+   * Retain the top K candidate coordinates (K = 5).
 5. **Micro-Patch Cropping:**
-   * Extract $4 \times 4$ pixel patches around each centroid at **original native resolution** (zero downsampling).
+   * Extract 4×4 pixel patches around each centroid at **original native resolution** (zero
+     downsampling) → 16 raw features.
+
+Labels are **weak**: each patch inherits the nodule's biopsy label. A patch inside a
+malignant nodule is tagged 1 even if that particular spot is not the lesion itself —
+this is stated as a limitation everywhere results appear.
 
 ---
 
@@ -82,50 +108,53 @@ This module replaces heuristic spatial despeckling with an entangled quantum fea
 
 ### Implementation Tasks
 1. **Dimensionality Reduction (Fitted on Train Only):**
-   * Fit PCA on `X_train_raw` ($16 \to 4$ components).
-   * Transform `X_test_raw` using the fitted training parameters.
-   * Min-Max scale values into the angle domain $[0, \pi]$.
+   * Fit PCA on `X_train_raw` (16 → 4 components); transform `X_test_raw` with the fitted
+     parameters; Min-Max scale into the angle domain [0, π].
 2. **Parameterized Circuit Construction:**
-   * Use Qiskit's `ZZFeatureMap`:
-     * Number of qubits: $n = 4$
-     * Repetitions: $d = 2$
-     * Entanglement topology: `'linear'` (keeps CNOT depth low for NISQ feasibility)
+   * Qiskit `ZZFeatureMap`: n = 4 qubits, d = 2 repetitions, entanglement `'linear'`
+     (keeps CNOT depth low for NISQ feasibility).
 3. **Optimized Gram Matrix Calculation:**
-   * Compute statevectors using `qiskit.quantum_info.Statevector`.
-   * Enforce Gram matrix symmetry ($K_{ij} = K_{ji}$) and set diagonals $K_{ii} = 1.0$ to halve the simulation cost.
+   * Compute statevectors with `qiskit.quantum_info.Statevector`; enforce K = Kᵀ and K_ii = 1.
+   * One statevector per sample + a single matmul instead of |A|×|B| individual circuit runs.
 4. **Classifier Training:**
-   * Train a precomputed Scikit-Learn `SVC` with balanced class weights to compensate for any remaining speckle-vs-lesion imbalance.
+   * Precomputed-kernel `SVC(class_weight='balanced')` — balancing the 3,574 : 1,426
+     malignant/benign imbalance at the patch level.
+5. **Feasibility cap:** kernel memory is O(N²), so training patches are balanced-subsampled
+   (`MAX_TRAIN_PATCHES = 2000`, seed 42); the test set stays whole (cross-kernel is O(N_test·N_train)).
 
 ---
 
 ## Module 4: Clinical Inference & Diagnostic Overlay Engine
 
-A project is incomplete if it only outputs an accuracy number in a terminal. This module processes raw patient images and generates visual clinical deliverables.
+A project is incomplete if it only outputs an accuracy number in a terminal.
 
 ```
        RAW SCAN INPUT                          PROCESSED CLINICAL OVERLAY
 ┌───────────────────────────┐            ┌───────────────────────────────────┐
 │     ~ ~ ~ ~ ~ ~ ~ ~       │            │        ~ ~ ~ ~ ~ ~ ~ ~            │
 │   ~ ~ [ NODULE ] ~ ~      │            │     ~ ~ [ NODULE ] ~ ~            │
-│       *  .   *            │   ─────►   │         🟢  .   🔴               │
-│     *      .              │            │       🟢      .                   │
+│       *  .   *            │   ─────►   │         🔴  .   🟢               │
+│     *      .              │            │       🔴      .                   │
 │    ~ ~ ~ ~ ~ ~ ~ ~ ~      │            │      ~ ~ ~ ~ ~ ~ ~ ~ ~            │
 └───────────────────────────┘            └───────────────────────────────────┘
-                                          🔴 Red Circle   = Quantum-Verified Microcalcification
-                                          🟢 Green Circle = Filtered Acoustic Speckle Artifact
+                                          🔴 Red Circle   = patch classified malignant
+                                          🟢 Green Circle = patch classified benign
+                                          yellow box      = annotated nodule ROI
 ```
 
 ### Implementation Tasks
-1. **Full-Image Stitcher (`inference.py`):**
-   * Ingest an unseen test image and its nodule coordinates.
-   * Classical stage flags candidate spots.
-   * Quantum stage classifies each candidate spot.
+1. **Full-Image Stitcher** (`src/pipeline.py`, `main.py predict`):
+   * Ingest an unseen test image (and its bbox, or read it from the XML).
+   * Classical stage flags candidate spots inside the ROI; quantum stage classifies each.
 2. **Clinical Visual Overlay:**
-   * Render green circles around spots classified as **Acoustic Speckle (Class 0)**.
-   * Render red circles around spots verified as **True Microcalcification (Class 1)**.
-3. **Automated TI-RADS Risk Re-Scoring:**
-   * If count of verified microcalcifications $\ge 1 \implies \mathbf{+2\text{ TI-RADS Points}}$ (elevates suspicion level).
-   * If all candidate spots are classified as speckle $\implies \mathbf{0\text{ Points}}$ (prevents unnecessary biopsy recommendation).
+   * Render green circles around patches classified as benign (0), red circles +
+     cross markers around patches classified as malignant (1); legend with counts.
+3. **Nodule-Level Verdict:**
+   * Majority vote over the K mined patches (ties broken by mean kernel margin) →
+     one decision and a confidence fraction for the whole nodule.
+   * TN5000 carries **no TI-RADS / composition / echogenicity metadata**, so the DDTI-era
+     TI-RADS re-scoring was removed rather than faked — the verdict is directly comparable
+     with the biopsy label.
 
 ---
 
@@ -135,60 +164,62 @@ This is the module that proves your thesis and earns top marks during your viva.
 
 ### Experiment A: The Sample-Efficiency Test (Proving the Quantum Advantage)
 * **Goal:** Prove that the quantum model outperforms classical models when training data is scarce.
-* **Method:** Train all models on sub-sampled training sets: $N \in \{15, 30, 60, 120\}$.
+* **Method:** Train all models on sub-sampled training sets: N ∈ {15, 30, 60, 120}.
 * **Models Compared:**
-  1. Proposed Hybrid Qiskit Model (QSVC)
+  1. Proposed Hybrid Qiskit Model (quantum-kernel SVC)
   2. Classical RBF Support Vector Machine
   3. Classical Random Forest (50 estimators)
   4. Classical 3-layer Multi-Layer Perceptron (MLP)
-* **Expected Result:** As $N$ drops below 40, classical neural networks overfit and their accuracy collapses; the quantum kernel maintains higher test accuracy due to its constrained, high-inductive-bias hypothesis space.
+* **Expected Result:** As N drops below 40, classical networks overfit and their accuracy
+  collapses; the quantum kernel may maintain higher accuracy due to its constrained,
+  high-inductive-bias hypothesis space. *If it does not, the honest conclusion stands.*
 
 ### Experiment B: Hardware Realism & Noise Simulation
 * **Goal:** Show that your circuit will survive on real IBM Quantum devices.
 * **Method:**
-  * Re-run test inferences using `qiskit_aer.AerSimulator` configured with a simulated **Depolarizing Noise Model** (error rates: $0.1\%, 0.5\%, 1.0\%$) and finite shot sampling ($N_{\text{shots}} = 1024$).
-  * Plot the decay of classification accuracy vs. noise rate to demonstrate fault tolerance.
+  * Re-run test inferences using `qiskit_aer.AerSimulator` with a **Depolarising Noise Model**
+    (error rates: 0.1%, 0.5%, 1.0%) and finite shot sampling (N_shots = 1024).
+  * Plot accuracy decay vs. noise rate to demonstrate fault tolerance.
 
 ### Experiment C: Candidate Mining Sensitivity (Ablation Study)
-* **Goal:** Answer the examiner question: *"Did your classical filter accidentally drop real cancers?"*
+* **Goal:** Answer the examiner question: *"Did your classical filter drop real cancers?"*
 * **Method:**
-  * Evaluate the candidate miner across 50 known microcalcification nodules.
-  * Count how often the true calcification was included in the top $K$ candidate pool.
-  * Report the **Candidate Mining Recall** (target: $\ge 96\%$).
+  * Sweep K ∈ {1, 3, 5, 8} and the top-hat threshold; retrain and report **nodule-level
+    malignant recall** (test: 731 malignant nodules) plus the fraction of nodules yielding
+    at least one candidate.
+  * Target: ≥ 96% of malignant nodules still produce candidates (mining is recall-first).
 
 ---
 
-## Module 6: Recommended Repository Layout
-
-Structure your project repository cleanly:
+## Module 6: Repository Layout
 
 ```text
-thyroid-quantum-cad/
+hqvision/
 │
-├── data/                       # DDTI images and XML files
-│   ├── 106_1.jpg
-│   ├── 106.xml
-│   └── ...
+├── data/
+│   └── Main data/              # TN5000 (git-ignored; or set $TN5000_DIR)
+│       ├── JPEGImages/         # 5000 .jpg
+│       ├── Annotations/        # 5000 .xml (VOC: bbox + label 1/0)
+│       └── ImageSets/Main/     # official trainval/test id lists
 │
 ├── src/
-│   ├── __init__.py
-│   ├── dataset.py              # Patient-isolated parsing and data loading
-│   ├── mining.py               # Classical CLAHE, Top-Hat, and NMS candidate miner
-│   ├── quantum_engine.py       # Qiskit ZZFeatureMap and Gram matrix calculation
-│   └── pipeline.py             # Full inference pipeline & image overlay renderer
+│   ├── config.py               # every tunable: paths, labels, caps, circuit params
+│   ├── dataset.py              # VOC parser, integrity audit, official split
+│   ├── mining.py               # CLAHE, Top-Hat, Weber contrast, NMS, 4x4 crop
+│   ├── cache.py                # mined-patch cache + balanced subsampling
+│   ├── quantum_engine.py       # ZZFeatureMap, Gram matrices, kernel SVC, noise
+│   └── pipeline.py             # inference, nodule verdict, overlay renderer
 │
-├── experiments/
-│   ├── benchmark_classical.py  # Comparison against SVM, Random Forest, MLP
-│   ├── sample_efficiency.py    # Few-shot accuracy curve generation
-│   └── noise_simulation.py     # Qiskit Aer noise and shot-budget analysis
+├── outputs/                    # git-ignored
+│   ├── cache/                  # mined patch pickles
+│   ├── models/                 # trained SVCs + metrics json
+│   ├── figures/                # charts (ROC, sample-efficiency, noise)
+│   └── annotated_scans/        # red/green overlays
 │
-├── outputs/
-│   ├── figures/                # Saved charts (ROC curves, sample efficiency plots)
-│   └── annotated_scans/        # Clinical output images with red/green overlays
-│
-├── requirements.txt            # Locked dependencies
-├── main.py                     # CLI entry-point to run end-to-end training
-└── README.md                   # Full documentation with architecture diagram
+├── train_hybrid_model.py       # DEPRECATED legacy DDTI/PennyLane baseline
+├── requirements.txt            # locked dependencies
+├── main.py                     # CLI: integrity | mine | train | predict | circuit
+└── docs/                       # plan, implementation plan, review, status
 ```
 
 ---
@@ -197,10 +228,10 @@ thyroid-quantum-cad/
 
 | Week | Student A Focus (Computer Vision & Data) | Student B Focus (Quantum Circuits & Qiskit) | Shared Deliverable |
 | :--- | :--- | :--- | :--- |
-| **W1-2** | Build XML parser, fix patient-level data leakage, implement data loader. | Set up Qiskit 1.x environment, configure `ZZFeatureMap` unit tests. | Clean, isolated dataset split and verified patient cohorts. |
-| **W3-4** | Implement Top-Hat filter, CLAHE, and NMS candidate mining. | Implement symmetric Gram matrix computation and test `Statevector` speed. | Verified micro-patch candidate dataset ($4 \times 4$). |
-| **W5-6** | Train classical baselines (RBF-SVM, Random Forest, MLP). | Train Qiskit QSVC model; optimize parameter assignments. | Core accuracy and confusion matrix comparisons. |
-| **W7** | Build the full-image clinical visualizer (red/green circle overlays). | Run Qiskit Aer noise simulations and sample-efficiency benchmarks. | Final charts, visual overlays, and performance tables. |
-| **W8** | Draft final capstone report (Methodology, Literature Review). | Draft Quantum Circuit Analysis, Complexity, and Defense sections. | Completed thesis report and slide deck. |
+| **W1-2** | TN5000 parser, integrity audit, official split wiring. | Qiskit 2.x environment, `ZZFeatureMap` tests. | Verified 4000/1000 split, zero overlap. |
+| **W3-4** | Top-Hat filter, CLAHE, NMS candidate mining on bboxes. | Gram matrix computation, `Statevector` speed test. | Mined patch dataset (4×4), cache layer. |
+| **W5-6** | Train classical baselines (RBF-SVM, RF, MLP). | Train quantum-kernel SVC; kernel comparison. | Accuracy / balanced accuracy / AUC tables. |
+| **W7** | Full-image visualizer (red/green overlay, verdict). | Aer noise simulations + sample-efficiency runs. | Final charts, overlays, performance tables. |
+| **W8** | Draft report (Methodology, Literature Review). | Draft Quantum Circuit Analysis & Defense sections. | Completed thesis report and slide deck. |
 
 ---

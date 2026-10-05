@@ -1,3 +1,17 @@
+"""
+DEPRECATED -- legacy DDTI + PennyLane baseline (superseded).
+
+This script was the original capstone baseline: DDTI XML parsing, microcalc /
+speckle labelling and a PennyLane AngleEmbedding classifier. The project now
+runs on TN5000 (biopsy-confirmed malignant / benign nodules) through
+``main.py``, and the PennyLane overlap kernel has been re-implemented in
+Qiskit as ``src.quantum_engine.build_overlap_feature_map``.
+
+Kept only for reference: the hand-rolled CNN feature extractor below is no
+longer part of the pipeline. Do not run it against TN5000 -- it expects DDTI
+XML (<calcifications>) that TN5000 does not have.
+"""
+
 import os
 import glob
 import xml.etree.ElementTree as ET
