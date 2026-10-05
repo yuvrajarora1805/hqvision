@@ -13,3 +13,5 @@ outputs/
 archive.zip
 
 .ipynb_checkpoints/
+Main data/
+data/processed/
